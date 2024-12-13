@@ -48,8 +48,9 @@ my $sql = "SELECT public.upsert_rpm_package_object(?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 
 # Tried all sorts of stuff for the queryformat for output of RPM; CSV, XML, etc.  Finally 
 # settled on OSV (Obnoxiously Separated Values) because of the unprectiable free-flow text
-# and that RPM queryformat is limited to in what it will throw...  Though it will throw BELLS
-# and BACKSPACES.
+# and that RPM queryformat is limited to in what it will throw...  Though it will throw BELLS.
+# ... Yes, I have already been told that there is a special place in Hell reserved for me.
+
 
 open RPM, "rpm -qa --qf \"\\a%{NAME}\\a\\b\\a%{VERSION}-%{RELEASE}.%{ARCH}\\a\\b\\a%{VERSION}\\a\\b\\a%{RELEASE}\\a\\b\\a%{ARCH}\\a\\b\\a%{INSTALLTIME}\\a\\b\\a%{RSAHEADER}\\a\\b\\a%{SHA1HEADER}\\a\\b\\a%{SIGGPG:pgpsig}\\a\\b\\a%{SIGPGP:pgpsig}\\a\\b\\a%{SIGMD5}\\a\\n\" |";
 

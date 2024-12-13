@@ -1,0 +1,75 @@
+
+REQUIREMENTS
+
+Server
+postgresql94-server
+pg_repack94
+
+Clients (including report)
+aide
+perl-DBD-Pg
+perl-URI
+perl-DateTime
+perl-Time-modules
+perl-IO-Compress-Zlib
+
+
+
+SERVER INSTALL
+
+yum install postgresql94-server pg_repack94
+service postgresql-9.4 initdb
+service postgresql-9.4 start
+su - postgres
+psql -f sql/fim.prep.sql
+psql -d fim sql/fim.sql
+exit
+cp etc/fim-pg_repack.cron /etc/cron.d
+
+
+
+CLIENT INSTALL
+yum install perl-DBD-Pg perl-URI perl-DateTime perl-Time-modules perl-IO-Compress-Zlib
+cp sbin/{aide-parser,fim-report,rpm-parser} /usr/local/sbin
+chown root:root /usr/local/sbin/{aide-parser,fim-report,rpm-parser}
+chmod 700 /usr/local/sbin/{aide-parser,fim-report,rpm-parser}
+cp etc/{aide-parser.config,fim-report.config,rpm-parser.config} /etc
+chown root:root /etc/{aide-parser.config,fim-report.config,rpm-parser.config}
+chmod 400 /etc/{aide-parser.config,fim-report.config,rpm-parser.config}
+
+Edit the config files for username, password, and database host.
+
+
+
+OPERATION
+
+The fim-report script only needs to be installed on a single host, it is the tool that 
+is used to approve changes and also provides nagios monitoring via the --nagios flag.
+
+aide-parser and rpm-parser should be run via root's cron, at least once a day, perhaps
+as often as six times a day.  The aide-parse script expects that a new aide.db has been
+created, and does not look for local copies of the aide database.  Also aide is prelink
+aware, so it is advise to to run perlink before running 'aide -i'.  An example for cron;
+*/6 * * * * /etc/cron.daily/prelink && /usr/sbin/aide -i && /usr/local/sbin/aide-parser /var/lib/aide/aide.db.new.gz
+
+rpm-parser uses the installed rpm tools to dump objects and pushes them into the database.
+Example cron;
+*/6 * * * * /usr/local/sbin/rpm-parser
+
+fim-report is the tool used for reporting changes and approving them, it does not need 
+to be installed on every host.  This script coalesces changes based on all changes seen.
+In other words, updating a RPM package will only report that the RPM has changed even though 
+it has installed scores of files that aide is now reporting as having changed.  It will also 
+review what aide is reporting on is what the RPM layed down.
+
+fim-report has two modes of operation '--nagios' and '--interactive'
+It is expected that 'nagios' be used for system monitoring from a central host and 
+'interactive' is used to approve changes.
+ 
+
+TODO:
+
+* Would be nice to get puppet to report changes and coalesce them.
+* Web interface for a pretty UI.
+
+

@@ -1,0 +1,138 @@
+#!/usr/bin/perl
+
+use strict;
+use DBI;
+use DBI qw(:sql_types);
+use DBD::Pg;
+use MIME::Base64;
+use Data::Dumper;
+use URI::Escape;
+
+if(my $err = read_config('/etc/aide-parser.config')) {
+  print "UNKNOWN: $err\n"; 
+  exit(3);
+}
+
+#my %config = (
+#  this_host => 'test.example.com',
+#  db => {
+#    'host' => '127.0.0.1',
+#    'port' => '5432',
+#    'base' => 'fim',
+#    'user' => 'aide',
+#    'pass' => 'change_this_value',
+#    'proc' => 'aide',
+#  },
+#);
+
+my $file = $ARGV[0];
+my $out;
+
+if ( ! -e $file) {
+  die "$file does not exist.";
+}
+
+if ($file =~ /\.gz$/) {
+  use IO::Uncompress::Gunzip qw(gunzip $GunzipError);
+  open(my $in, $file);
+  gunzip $in => \$out; 
+  close($in);
+
+  $out =~ s/.*?\@\@db_spec //ms;
+  my (@line) = split("\n", $out);
+  my (@field_name) = split(" ", (shift(@line)));
+
+
+  # connect to database
+  my $dbh = DBI->connect("dbi:Pg:dbname=$__config::config{'db'}{'base'};host=$__config::config{'db'}{'host'};port=$__config::config{'db'}{'port'}", $__config::config{'db'}{'user'}, $__config::config{'db'}{'pass'});
+
+  my $start = time();
+  my $dbsql = "SELECT upsert_run_job(?, ?, ?, ?)";
+  my $sth = $dbh->prepare( $dbsql );
+  $sth->bind_param(1, 'DATABASE_RUN', { TYPE => SQL_VARCHAR });
+  $sth->execute('DATABASE_RUN', $__config::config{'this_host'}, $__config::config{'db'}{'proc'}, 'START');
+
+  my $sql = "SELECT public.upsert_aide_object(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+  my %data = ();
+  foreach my $l (@line) {
+    my @field_item = split(" ", $l);
+    my $name = uri_unescape(shift(@field_item));
+    print "aide: $name\n";
+    foreach my $i (1..$#field_item) {
+      $data{$field_name[$i+1]} = $field_item[$i];
+    } 
+
+    foreach my $l (qw/lname md5 sha1 sha256 sha512 rmd160 tiger acl selinux mtime ctime/) {
+      if ($data{$l} =~ /^0$/) {
+        $data{$l} = undef; 
+      }
+    }
+    foreach my $l (qw/md5 sha1 sha256 sha512 rmd160 tiger/) {
+      if (exists $data{$l}) {
+        $data{$l} = unpack("H*", decode_base64($data{$l}));
+      }
+    }
+    foreach my $l (qw/xattrs selinux/) {
+      if ($data{$l}) {
+        $data{$l} = decode_base64($data{$l});
+      }
+    }
+    if ($data{'acl'} && $data{'acl'} =~ /^POSIX,.*,0$/) {
+      (my $junk, $data{'acl'}) = split(',', $data{'acl'});
+      $data{'acl'} = decode_base64($data{'acl'});
+    }
+    #foreach my $l (keys %data) {
+    #  $sth = $dbh->prepare( $sql );
+    #  $sth->execute( $__config::config{'this_host'}, $__config::config{'db'}{'proc'}, $name, $l, $data{$l});
+    #}
+
+# name lname attr perm uid gid md5 sha256 acl xattrs selinux 
+
+#    in_host character varying,
+#    in_proc character varying,
+#    in_name character varying,
+#    in_attr          NUMERIC,
+#    in_perm          character varying,
+#    in_uid           NUMERIC,
+#    in_gid           NUMERIC,
+#    in_md5           character varying,
+#    in_sha256        character varying,
+#    in_acl           character varying,
+#    in_xattr         character varying,
+#    in_selinux       character varying
+ 
+    $sth = $dbh->prepare( $sql );
+    $sth->execute( $__config::config{'this_host'}, $__config::config{'db'}{'proc'}, $name, $data{'attr'}, 
+                   $data{'perm'}, $data{'uid'}, $data{'gid'}, $data{'md5'}, 
+                   $data{'sha256'}, $data{'acl'}, $data{'xattr'}, $data{'selinux'});  
+  }
+  my $stop = time();
+  my $dbsql2 = "SELECT upsert_run_job(?, ?, ?, ?)";
+  $sth = $dbh->prepare( $dbsql2 );
+  $sth->bind_param(1, 'DATABASE_RUN', { TYPE => SQL_VARCHAR });
+  $sth->execute('DATABASE_RUN', $__config::config{'this_host'}, $__config::config{'db'}{'proc'}, 'STOP');
+  $sth->finish();
+  $dbh->disconnect;
+}
+
+sub read_config {
+  my $file = $_[0];
+  our $err;
+  {   # Put config data into a separate namespace
+    package __config;
+
+    # Process the contents of the config file
+    my $rc = do($file);
+
+    # Check for errors
+    if ($@) {
+      $::err = "ERROR: Failure compiling '$file' - $@";
+    } elsif (! defined($rc)) {
+      $::err = "ERROR: Failure reading '$file' - $!";
+    } elsif (! $rc) {
+      $::err = "ERROR: Failure processing '$file'";
+    }
+  }
+  return ($err);
+}
+

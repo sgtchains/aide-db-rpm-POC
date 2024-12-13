@@ -1,0 +1,366 @@
+#!/usr/bin/perl
+
+use strict;
+use Getopt::Long;
+use DBI;
+use DBD::Pg;
+use Getopt::Long;
+use MIME::Base64;
+use Time::Local;
+use Data::Dumper;
+
+if(my $err = read_config('/var/lib/aide/config.config')) {
+  print "UNKNOWN: $err\n"; 
+  exit(3);
+}
+
+GetOptions (
+  "host=s"      => \$__config::config{'query_host'},
+  "nagios"      => \$__config::config{'nagios'},
+  "interactive" => \$__config::config{'interactive'},
+  "help"        => \$__config::config{'help'}
+);
+
+if (! $__config::config{'query_host'}) {
+  die "$__config::config{'me'} requires --host argument";
+}
+
+my $tmp;
+my %data;
+
+# connect to database
+my $dbh = DBI->connect("dbi:Pg:dbname=$__config::config{'db'}{'base'};host=$__config::config{'db'}{'host'};port=$__config::config{'db'}{'port'}", $__config::config{'db'}{'user'}, $__config::config{'db'}{'pass'});
+my $sth;
+
+my $sql = "SELECT
+    aide_objects.key as aide_key,
+    aide_objects.name as aide_name,
+    aide_objects.removed as aide_removed,
+    aide_objects.correlated as aide_correlated,
+    aide_objects.reviewed as aide_reviewed,
+    aide_objects.first_date as aide_first_date,
+    aide_objects.last_date as aide_last_date,
+    extract(epoch from aide_objects.last_date) as aide_last_epoch,
+    aide_objects.attr as aide_attr,
+    aide_objects.perm as aide_perm,
+    aide_objects.uid as aide_uid,
+    aide_objects.gid as aide_gid,
+    aide_objects.md5 as aide_md5,
+    aide_objects.sha256 as aide_sha256,
+    aide_objects.acl as aide_acl,
+    aide_objects.xattr as aide_xattr,
+    aide_objects.selinux as aide_selinux
+  FROM aide_objects 
+  WHERE reviewed = 'f'
+    AND report_host = ?;";
+$sth = $dbh->prepare( $sql );
+$sth->execute($__config::config{'query_host'});
+while (my $ref = $sth->fetchrow_hashref) {
+  %{$data{'aide'}{$ref->{'aide_name'}}{'epoch'}{$ref->{'aide_last_epoch'}}} = %{$ref};
+}  
+
+
+$sql = "
+  SELECT
+    rpm_file_objects.key as file_key, 
+    rpm_file_objects.first_date as file_first_date, 
+    rpm_file_objects.fileclass as file_fileclass,
+    rpm_file_objects.rpmname as file_rpmname, 
+    rpm_file_objects.ver_rel_arch as file_ver_rel_arch,
+    rpm_file_objects.fileusername as file_fileusername, 
+    rpm_file_objects.filegroupname as file_filegroupname,
+    rpm_file_objects.filedevices as file_filedevices, 
+    rpm_file_objects.sha256 as file_sha256,
+    rpm_file_objects.perm as file_perm, 
+    rpm_file_objects.fileverifyflags as file_fileverifyflags,
+    rpm_file_objects.uid as file_uid, 
+    rpm_file_objects.gid as file_gid, 
+    rpm_file_objects.name as file_name,
+    rpm_package_objects.key as pkg_key, 
+    rpm_package_objects.name as pkg_name,
+    rpm_package_objects.removed as pkg_removed, 
+    rpm_package_objects.correlated as pkg_correlated,
+    rpm_package_objects.reviewed as pkg_reviewed, 
+    rpm_package_objects.first_date as pkg_first_date,
+    extract(epoch from rpm_package_objects.first_date) as pkg_first_epoch,
+    rpm_package_objects.last_date as pkg_last_date, 
+    extract(epoch from rpm_package_objects.last_date) as pkg_last_epoch, 
+    rpm_package_objects.ver_rel_arch as pkg_ver_rel_arch,  
+    rpm_package_objects.installtime as pkg_installtime,
+    rpm_package_objects.sha1header as pkg_sha1header, 
+    rpm_package_objects.siggpg_date as pkg_siggpg_date,
+    rpm_package_objects.siggpg_key as pkg_siggpg_date, 
+    rpm_package_objects.sigmd5 as pkg_sigmd5
+  FROM rpm_package_objects
+  JOIN rpm_file_objects ON rpm_package_objects.name=rpm_file_objects.rpmname
+  WHERE 
+      rpm_file_objects.ver_rel_arch = rpm_package_objects.ver_rel_arch 
+      AND rpm_package_objects.reviewed = 'f'
+      AND rpm_package_objects.report_host = ?
+  ORDER BY rpm_package_objects.key
+  ;";
+      
+$sth = $dbh->prepare( $sql );
+$sth->execute($__config::config{'query_host'});
+while (my $ref = $sth->fetchrow_hashref) {
+  %{$data{'report'}{'pkg'}{$ref->{'pkg_name'}}{$ref->{'pkg_last_epoch'}}{'files'}{$ref->{'file_name'}}} = %{$ref};
+  %{$data{'times'}{$ref->{'pkg_name'}}{$ref->{'pkg_first_epoch'}}{$ref->{'pkg_key'}}} = %{$ref};
+  if(exists $data{'aide'}{$ref->{'file_name'}}) {
+    foreach my $aide_epoch (keys %{$data{'aide'}{$ref->{'file_name'}}{'epoch'}}) {
+      if ( $data{'aide'}{'removed'} == 0 && $ref->{'pkg_removed'} == 0 ) {
+        if ( comp_files(\%{$data{'aide'}{$ref->{'file_name'}}}, $ref) ) {
+          # Something is different
+        } else { 
+          $data{'report'}{'pkg'}{$ref->{'pkg_name'}}{$ref->{'pkg_last_epoch'}}{'aide_keys'}{$data{'aide'}{$ref->{'file_name'}}{'epoch'}{$aide_epoch}{'aide_key'}} = undef;
+          # Dont need this any more
+          delete $data{'aide'}{$ref->{'file_name'}};
+          delete $data{'report'}{'pkg'}{$ref->{'pkg_name'}}{$ref->{'pkg_last_epoch'}}{'files'}{$ref->{'file_name'}};
+        }
+      } else {
+        $data{'report'}{'pkg'}{$ref->{'pkg_name'}}{$ref->{'pkg_last_epoch'}}{'aide_keys'}{$data{'aide'}{$ref->{'file_name'}}{'epoch'}{$aide_epoch}{'aide_key'}} = undef;
+        delete $data{'aide'}{$ref->{'file_name'}};
+        delete $data{'report'}{'pkg'}{$ref->{'pkg_name'}}{$ref->{'pkg_last_epoch'}}{'files'}{$ref->{'file_name'}};
+      }
+    }
+  }
+}  
+
+$sql = "
+  SELECT
+    aide_objects.key as aide_key,
+    aide_objects.name as aide_name,
+    aide_objects.removed as aide_removed,
+    aide_objects.correlated as aide_correlated,
+    aide_objects.reviewed as aide_reviewed,
+    aide_objects.first_date as aide_first_date,
+    aide_objects.last_date as aide_last_date,
+    extract(epoch from aide_objects.last_date) as aide_last_epoch,
+    aide_objects.attr as aide_attr,
+    aide_objects.perm as aide_perm,
+    aide_objects.uid as aide_uid,
+    aide_objects.gid as aide_gid,
+    aide_objects.md5 as aide_md5,
+    aide_objects.sha256 as aide_sha256,
+    aide_objects.acl as aide_acl,
+    aide_objects.xattr as aide_xattr,
+    aide_objects.selinux as aide_selinux
+  FROM aide_objects
+  WHERE reviewed = 't' 
+  AND report_host = ?
+  AND name = ?
+  LIMIT 1;";
+foreach my $aide_file (keys %{$data{'aide'}}) {
+  $sth = $dbh->prepare( $sql );
+  $sth->execute($__config::config{'query_host'}, $aide_file);
+  while (my $ref = $sth->fetchrow_hashref) {
+    %{$data{'aide'}{$ref->{'aide_name'}}{'epoch'}{$ref->{'aide_last_epoch'}}} = %{$ref};
+  }  
+}
+
+foreach my $loop1 (keys %{$data{'aide'}}) {
+  foreach my $loop2 (sort { $a <=> $b } keys %{$data{'aide'}{$loop1}{'epoch'}}) {
+    push(@{$data{'output'}{'aide'}{$loop1}}, \%{$data{'aide'}{$loop1}{'epoch'}{$loop2}});
+  }
+}
+foreach my $loop1 (keys %{$data{'output'}{'aide'}}) {
+  print "\n" if ($__config::config{'interactive'});
+  if ($#{$data{'output'}{'aide'}{$loop1}} == 0 ) {
+    $data{'nagios'}{'aide'}{'add'}++;
+    print "File added: $loop1\n" if ($__config::config{'interactive'});
+  } else {
+    $tmp = ${$data{'output'}{'aide'}{$loop1}}[0];
+    shift(@{$data{'output'}{'aide'}{$loop1}});
+    foreach my $loop2 (@{$data{'output'}{'aide'}{$loop1}}) {
+      if ($tmp->{'removed'}) {
+        $data{'nagios'}{'aide'}{'add'}++;
+        print "File added: $loop1\n" if ($__config::config{'interactive'});
+      } elsif (${$data{'output'}{'aide'}{$loop1}}[0]->{'removed'}) {
+        $data{'nagios'}{'aide'}{'del'}++;
+        print "File removed: $loop1\n" if ($__config::config{'interactive'});
+      } else {  
+        $data{'nagios'}{'aide'}{'chg'}++;
+        print "File changed: $loop1\n" if ($__config::config{'interactive'});
+      }
+      if ($__config::config{'interactive'}) {
+        foreach my $field (qw/attr perm uid gid md5 sha256 acl xattr selinux/) {
+          if ($tmp->{"aide_$field"} !~ /^${$data{'output'}{'aide'}{$loop1}}[0]->{"aide_$field"}$/) {
+            my @left = split("\n", $tmp->{"aide_$field"});
+            my @right = split("\n", ${$data{'output'}{'aide'}{$loop1}}[0]->{"aide_$field"});
+            my $line_count = $#left;
+            $line_count = $#right if ($#right > $#left); 
+            printf ("  %-7s %s => %s\n", $field, $left[0], $right[0]);  
+            foreach my $count (1..$line_count) {
+              printf("          %s => %s\n", $left[$count], $right[$count]);
+            }
+          }
+        }
+        print "Accept this change? ([y]es/[n]o) ";
+        my $input = <>;
+        until($input =~ /^\s*(?:y(?:es)?|n(?:o)?)\s*$/i ) {
+          $input = <>;
+        }
+        $input =~ s/\s//g;
+        if ($input =~ /^y/i) {
+          $sql = "SELECT set_reviewed_aide(?);";
+          $sth = $dbh->prepare( $sql );
+          $sth->execute( ${$data{'output'}{'aide'}{$loop1}}[0]->{'aide_key'} );
+        }
+      }
+    }
+  }
+}  
+
+$sql = "SELECT 
+    rpm_package_objects.key as pkg_key, 
+    rpm_package_objects.name as pkg_name,
+    rpm_package_objects.removed as pkg_removed, 
+    rpm_package_objects.correlated as pkg_correlated,
+    rpm_package_objects.reviewed as pkg_reviewed, 
+    rpm_package_objects.first_date as pkg_first_date,
+    extract(epoch from rpm_package_objects.first_date) as pkg_first_epoch,
+    rpm_package_objects.last_date as pkg_last_date, 
+    extract(epoch from rpm_package_objects.last_date) as pkg_last_epoch, 
+    rpm_package_objects.ver_rel_arch as pkg_ver_rel_arch,  
+    rpm_package_objects.installtime as pkg_installtime,
+    rpm_package_objects.sha1header as pkg_sha1header, 
+    rpm_package_objects.siggpg_date as pkg_siggpg_date,
+    rpm_package_objects.siggpg_key as pkg_siggpg_key, 
+    rpm_package_objects.sigmd5 as pkg_sigmd5
+  FROM rpm_package_objects
+  WHERE 
+    report_host = ?
+    AND key < ? 
+    AND name = ?
+    AND ver_rel_arch = ?
+  ORDER BY last_date
+  LIMIT 1;
+";
+
+foreach my $pkg_name (sort { $a <=> $b } keys %{$data{'times'}}) {
+  foreach  my $pkg_epoch (sort {$a <=> $b } keys %{$data{'times'}{$pkg_name}}) {
+    print "\n" if ($__config::config{'interactive'});
+    my @tmp_key;
+    foreach my $pkg_key (sort { $b <=> $a } keys %{$data{'times'}{$pkg_name}{$pkg_epoch}}) {
+      push(@tmp_key, $pkg_key);
+      if ($data{'times'}{$pkg_name}{$pkg_epoch}{$pkg_key}{'pkg_removed'}) {
+        $sth = $dbh->prepare( $sql );
+        $sth->execute( $__config::config{'query_host'}, $pkg_key, $pkg_name, $data{'times'}{$pkg_name}{$pkg_epoch}{$pkg_key}{'pkg_ver_rel_arch'});
+        %{$data{'times'}{$pkg_name}{$pkg_epoch}{$pkg_key}{'old_rpm'}} = %{ $sth->fetchrow_hashref };
+      }
+    }
+    if ($#tmp_key == 0) {
+      if ($data{'times'}{$pkg_name}{$pkg_epoch}{$tmp_key[0]}{'pkg_removed'}) {
+        $data{'nagios'}{'rpm'}{'del'}++;
+        print "Package removed: $pkg_name\n" if ($__config::config{'interactive'});
+      }  else {
+        $data{'nagios'}{'rpm'}{'add'}++;
+        print "Package added: $pkg_name\n" if ($__config::config{'interactive'});
+      }
+    } else {
+      $data{'nagios'}{'rpm'}{'chg'}++;
+      if ($__config::config{'interactive'}) {
+        print "Package updated: $pkg_name\n";
+        foreach my $attribute (qw /ver_rel_arch installtime sha1header siggpg_date siggpg_key sigmd5/) {
+          if ($data{'times'}{$pkg_name}{$pkg_epoch}{$tmp_key[0]}{"pkg_$attribute"} !~ /^$data{'times'}{$pkg_name}{$pkg_epoch}{$tmp_key[1]}{'old_rpm'}{"pkg_$attribute"}$/) {
+            my @left = split("\n", $data{'times'}{$pkg_name}{$pkg_epoch}{$tmp_key[0]}{'old_rpm'}{"pkg_$attribute"}); 
+            my @right = split("\n", $data{'times'}{$pkg_name}{$pkg_epoch}{$tmp_key[1]}{"pkg_$attribute"});
+            my $line_count = $#left;
+            $line_count = $#right if ($#right > $#left);
+            printf ("  %-7s %s => %s\n", $attribute, $left[0], $right[0]);
+            foreach my $count (1..$line_count) {
+              printf("          %s => %s\n", $left[$count], $right[$count]);
+            }
+          }
+        }
+      }
+    }
+    if ($__config::config{'interactive'}) {
+      print "Accept this change? ([y]es/[n]o) ";
+      my $input = <>;
+      until($input =~ /^\s*(?:y(?:es)?|n(?:o)?)\s*$/i ) {
+        $input = <>;
+      }
+      $input =~ s/\s//g;
+      if ($input =~ /^y/i) {
+        foreach my $loop (@tmp_key) {
+          my $sql_update_rpm = "SELECT set_reviewed_rpm_package(?);";
+          $sth = $dbh->prepare( $sql_update_rpm );
+          $sth->execute( $loop );
+          my $sql_update_aide = "SELECT set_reviewed_aide(?);";
+          foreach my $loop2 (keys %{$data{'report'}{'pkg'}{$pkg_name}{$pkg_epoch}{'aide_keys'}}) {
+            $sth = $dbh->prepare( $sql_update_aide );
+            $sth->execute( $loop2 );
+          }
+        }
+      }
+    }
+  }
+}
+
+if ($__config::config{'nagios'}) {
+  if (exists $data{'nagios'}) {
+    print "CRIT: ";
+    foreach my $i1 ( qw/aide rpm/ ) {
+      print "$i1(";
+      foreach my $i2 ( qw/add del/ ) {
+        print "$i2=" . ($data{'nagios'}{$i1}{$i2} + 0) . ",";
+      }
+      print "chg=" . ($data{'nagios'}{$i1}{'chg'} + 0) . ") ";
+    }
+   print "\n";
+   exit 2;
+  } else {
+    print "OK\n";
+  }
+}
+
+
+sub comp_files {
+  my $aide = $_[0];
+  my $rpm  = $_[1];
+  my (@aide_times) = sort { $a <=> $b } keys %{$aide->{'epoch'}};
+
+  my $return = 0;
+
+  foreach my $epoch (@aide_times) {
+    if ($aide->{'epoch'}{$epoch}{'aide_sha256'} !~ /^$rpm->{'file_sha256'}$/) {
+      print "($aide->{'epoch'}{$epoch}{'aide_sha256'} !~ /^$rpm->{'file_sha256'}\$/)\n";
+      $return = 1;
+    }
+    if ($aide->{'epoch'}{$epoch}{'aide_uid'}    !~ /^$rpm->{'file_uid'}$/) {
+      print "($aide->{'epoch'}{$epoch}{'aide_uid'}    !~ /^$rpm->{'file_uid'}\$/)\n";
+      $return = 1;
+    }
+    if ($aide->{'epoch'}{$epoch}{'aide_gid'}    !~ /^$rpm->{'file_gid'}$/) {
+      print "($aide->{'epoch'}{$epoch}{'aide_gid'}    !~ /^$rpm->{'file_gid'}\$/)\n";
+      $return = 1;
+    }
+    if ($aide->{'epoch'}{$epoch}{'aide_perm'}   !~ /^$rpm->{'file_perm'}$/) {
+      print "($aide->{'epoch'}{$epoch}{'aide_perm'}   !~ /^$rpm->{'file_perm'}\$/)\n";
+      $return = 1;
+    }
+  }
+  print "comp_files() = 1\n" if ($return);
+  return $return;
+}
+
+sub read_config {
+  my $file = $_[0];
+  our $err;
+  {   # Put config data into a separate namespace
+    package __config;
+
+    # Process the contents of the config file
+    my $rc = do($file);
+
+    # Check for errors
+    if ($@) {
+      $::err = "ERROR: Failure compiling '$file' - $@";
+    } elsif (! defined($rc)) {
+      $::err = "ERROR: Failure reading '$file' - $!";
+    } elsif (! $rc) {
+      $::err = "ERROR: Failure processing '$file'";
+    }
+  }
+  return ($err);
+}

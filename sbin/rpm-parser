@@ -1,0 +1,238 @@
+#!/usr/bin/perl
+
+use strict;
+use DBI;
+use DBI qw(:sql_types);
+use DBD::Pg;
+use Time::ParseDate;
+use DateTime;
+
+use Data::Dumper;
+
+
+if(my $err = read_config('/etc/rpm-parser.config')) {
+  print "UNKNOWN: $err\n"; 
+  exit(3);
+}
+
+my %uid = ();
+my %gid = ();
+my $junk;
+
+my %rpm_files_check = ();
+
+my @packageflags = qw/
+name
+ver-rel.arch
+version
+release
+arch
+installtime
+rsaheader
+sha1header
+siggpg
+sigpgp
+sigmd5
+/;
+
+# connect to database
+my $dbh = DBI->connect("dbi:Pg:dbname=$__config::config{'db'}{'base'};host=$__config::config{'db'}{'host'};port=$__config::config{'db'}{'port'}", $__config::config{'db'}{'user'}, $__config::config{'db'}{'pass'});
+
+my $dbsql = "SELECT upsert_run_job(?, ?, ?, ?)";
+my $sth = $dbh->prepare( $dbsql );
+$sth->bind_param(1, 'DATABASE_RUN', { TYPE => SQL_VARCHAR });
+$sth->execute('DATABASE_RUN', $__config::config{'this_host'}, $__config::config{'db'}{'proc'}, 'START');
+
+my $sql = "SELECT public.upsert_rpm_package_object(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+
+
+# Tried all sorts of stuff for the queryformat for output of RPM; CSV, XML, etc.  Finally 
+# settled on OSV (Obnoxiously Seperated Values) because of the unprectiable free-flow text
+# and that RPM queryformat is limited to in what it will throw...  Though it will throw BELLS
+# and BACKSPACES.
+
+open RPM, "rpm -qa --qf \"\\a%{NAME}\\a\\b\\a%{VERSION}-%{RELEASE}.%{ARCH}\\a\\b\\a%{VERSION}\\a\\b\\a%{RELEASE}\\a\\b\\a%{ARCH}\\a\\b\\a%{INSTALLTIME}\\a\\b\\a%{RSAHEADER}\\a\\b\\a%{SHA1HEADER}\\a\\b\\a%{SIGGPG:pgpsig}\\a\\b\\a%{SIGPGP:pgpsig}\\a\\b\\a%{SIGMD5}\\a\\n\" |";
+
+while (<RPM>) {
+  my $line = $_;
+  chomp($line);
+  my (@field_item) = split("\b", $line);
+
+  my $name = $field_item[0];
+  $name =~ s/\a//g;
+
+  my %data = ();
+  foreach my $i (0..$#packageflags) {
+    $field_item[$i] =~ s/\a//g;
+    next if ($field_item[$i] eq '(none)');
+    next if ($field_item[$i] eq '');
+    $data{$packageflags[$i]} = $field_item[$i];
+  }
+
+
+#  if ($name =~ /^(gpg-pubkey|kernel|kernel-devel)$/) {
+#    $name .= "-" . $data{'version'} . "-" . $data{'release'};
+#    delete $data{'ver-rel.arch'};
+#    delete $data{'version'};
+#    delete $data{'release'};
+#  }
+
+  print "rpm-package: $name\n";
+
+  if (exists $data{'sigpgp'} && not exists $data{'siggpg'}) {
+    $data{'siggpg'} = $data{'sigpgp'};
+    delete $data{'sigpgp'};
+  }
+
+  ($junk, $data{'siggpg_date'}, $data{'siggpg_key'}) = split(', ', $data{'siggpg'});
+  delete $data{'siggpg'}; 
+
+  if ($data{'siggpg_date'}) {
+    my $e = parsedate($data{'siggpg_date'});
+    my $dt = DateTime->from_epoch( epoch => $e );
+    $data{'siggpg_date'} = sprintf("%4d-%02d-%02d %02d:%02d:%02d", $dt->year, $dt->month, $dt->day, $dt->hour, $dt->minute, $dt->second);
+  }
+
+  #    Column    |            Type             |                             Modifiers                             
+  #--------------+-----------------------------+-------------------------------------------------------------------
+  # key          | bigint                      | not null default nextval('rpm_package_objects_key_seq'::regclass)
+  # name         | character varying(8192)     | not null
+  # [...]
+  # ver_rel_arch | character varying(256)      | 
+  # version      | character varying(256)      | 
+  # release      | character varying(256)      | 
+  # arch         | character varying(256)      | 
+  # installtime  | numeric                     | 
+  # sha1header   | character varying(128)      | 
+  # siggpg_date  | timestamp without time zone | 
+  # siggpg_key   | character varying(64)       | 
+  # sigmd5       | character varying(64)       | 
+
+  $sth = $dbh->prepare( $sql );
+  $sth->execute( $__config::config{'this_host'}, $__config::config{'db'}{'proc'}, $name, $data{'ver-rel.arch'}, $data{'version'}, $data{'release'}, $data{'arch'}, $data{'installtime'}, $data{'sha1header'}, $data{'siggpg_date'}, $data{'siggpg_key'}, $data{'sigmd5'});
+  my ($tmp) = $sth->fetchrow_array();
+  $rpm_files_check{"$data{'name'}-$data{'ver-rel.arch'}"} = 1 if (!$tmp);
+}
+close(RPM);
+
+$sth = $dbh->prepare( $dbsql );
+$sth->bind_param(1, 'DATABASE_RUN', { TYPE => SQL_VARCHAR });
+$sth->execute('DATABASE_RUN', $__config::config{'this_host'}, $__config::config{'db'}{'proc'}, 'STOP');
+
+if (scalar(keys %rpm_files_check)) {
+  $sth = $dbh->prepare( $dbsql );
+  $sth->bind_param(1, 'DATABASE_RUN', { TYPE => SQL_VARCHAR });
+  $sth->execute('DATABASE_RUN', $__config::config{'this_host'}, 'rpm-file', 'START');
+
+  $sql = "SELECT upsert_rpm_file_object(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);"; 
+
+  my %uid = ();
+  my %gid = ();
+
+  my @fileflags = qw/
+    filename
+    fileclass
+    rpmname
+    ver-rel.arch
+    fileusername
+    filegroupname
+    filedevices
+    sha256
+    perm
+    fileverifyflags
+  /;
+
+  foreach my $package (keys %rpm_files_check) {
+
+    open RPM, "rpm -q $package --qf \"[\\a%{FILENAMES}\\a\\b\\a%{FILECLASS}\\a\\b\\a%{=NAME}\\a\\b\\a%{VERSION}-%{RELEASE}.%{ARCH}\\a\\b\\a%{FILEUSERNAME}\\a\\b\\a%{FILEGROUPNAME}\\a\\b\\a%{FILEDEVICES}\\a\\b\\a%{FILEMD5S}\\a\\b\\a%{FILEMODES:octal}\\a\\b\\a%{FILEVERIFYFLAGS:vflags}\\a\\n]\" |";
+
+    while(<RPM>) {
+      my $line = $_;
+      chomp($line);
+      my (@field_item) = split("\b", $line);
+ 
+      my $name = $field_item[0];
+      $name =~ s/\a//g;
+      next if ($name eq '(none)');
+      print "rpm-file: $name\n";
+      my %data = ();
+
+      $data{'package'} = $package;
+      foreach my $i (1..$#fileflags) {
+        $field_item[$i] =~ s/\a//g;
+        next if ($field_item[$i] eq '(none)');
+        next if ($field_item[$i] eq '');
+        $data{$fileflags[$i]} = $field_item[$i];
+      }
+
+      if (exists $data{'fileusername'}) {
+        if (not $uid{$data{'fileusername'}}) {
+          open ID, "id -u $data{'fileusername'} |";
+          $uid{$data{'fileusername'}} = <ID>;
+          chomp($uid{$data{'fileusername'}});
+          close ID; 
+        }
+        $data{'uid'} = $uid{$data{'fileusername'}};
+      }
+
+      if (exists $data{'filegroupname'}) {
+        if (not $gid{$data{'filegroupname'}}) {
+          open ID, "id -g $data{'filegroupname'} |";
+          $gid{$data{'filegroupname'}} = <ID>;
+          chomp($gid{$data{'filegroupname'}});
+          close ID; 
+        }
+        $data{'gid'} = $gid{$data{'filegroupname'}};
+      }
+
+# ALTER FUNCTION public.upsert_rpm_file_object(
+#   in_host character varying,
+#   in_proc character varying,
+#   in_name character varying,
+#   in_fileclass character varying,
+#   in_rpmname character varying,
+#   in_ver_rel_arch character varying,
+#   in_fileusername character varying,
+#   in_filegroupname character varying,
+#   in_filedevices character varying,
+#   in_sha256 character varying,
+#   in_perm character varying,
+#   in_fileverifyflags character varying,
+#   in_uid numeric,
+#   in_gid numeric
+# ) OWNER TO fim_database;
+
+      $sth = $dbh->prepare( $sql );
+      print "$name, $data{'fileclass'}, $data{'rpmname'}, $data{'ver-rel.arch'}, $data{'fileusername'}, $data{'filegroupname'}, $data{'filedevices'}, $data{'sha256'}, $data{'perm'}, $data{'fileverifyflags'}, $data{'uid'}, $data{'gid'}\n";
+      $sth->execute( $__config::config{'this_host'}, $__config::config{'db'}{'subproc'}, $name, $data{'fileclass'}, $data{'rpmname'}, $data{'ver-rel.arch'}, $data{'fileusername'}, $data{'filegroupname'}, $data{'filedevices'}, $data{'sha256'}, $data{'perm'}, $data{'fileverifyflags'}, $data{'uid'}, $data{'gid'}); 
+    }
+    close(RPM);
+  }
+  $sth = $dbh->prepare( $dbsql );
+  $sth->bind_param(1, 'DATABASE_RUN', { TYPE => SQL_VARCHAR });
+  $sth->execute('DATABASE_RUN', $__config::config{'this_host'}, 'rpm-file', 'STOP');
+}
+
+$sth->finish();
+$dbh->disconnect;
+
+sub read_config {
+  my $file = $_[0];
+  our $err;
+  {   # Put config data into a separate namespace
+    package __config;
+
+    # Process the contents of the config file
+    my $rc = do($file);
+
+    # Check for errors
+    if ($@) {
+      $::err = "ERROR: Failure compiling '$file' - $@";
+    } elsif (! defined($rc)) {
+      $::err = "ERROR: Failure reading '$file' - $!";
+    } elsif (! $rc) {
+      $::err = "ERROR: Failure processing '$file'";
+    }
+  }
+  return ($err);
+}

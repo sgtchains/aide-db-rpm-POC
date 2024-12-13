@@ -47,7 +47,7 @@ my $sql = "SELECT public.upsert_rpm_package_object(?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
 
 
 # Tried all sorts of stuff for the queryformat for output of RPM; CSV, XML, etc.  Finally 
-# settled on OSV (Obnoxiously Seperated Values) because of the unprectiable free-flow text
+# settled on OSV (Obnoxiously Separated Values) because of the unprectiable free-flow text
 # and that RPM queryformat is limited to in what it will throw...  Though it will throw BELLS
 # and BACKSPACES.
 

@@ -57,7 +57,7 @@ is used to approve changes and also provides nagios monitoring via the --nagios 
 aide-parser and rpm-parser should be run via root's cron, at least once a day, perhaps
 as often as six times a day.  The aide-parse script expects that a new aide.db has been
 created, and does not look for local copies of the aide database.  Also aide is prelink
-aware, so it is advise to to run perlink before running 'aide -i'.  An example for cron;
+aware, so it is advised to run perlink before running 'aide -i'.  An example for cron;
 0 0 * * * /etc/cron.daily/prelink && /usr/sbin/aide -i && /usr/local/sbin/aide-parser /var/lib/aide/aide.db.new.gz
 
 rpm-parser uses the installed rpm tools to dump objects and pushes them into the database.
